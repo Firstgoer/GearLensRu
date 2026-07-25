@@ -1,9 +1,10 @@
 ## Interface: 50504
 ## Title: GearLensRu
 ## Notes: Показывает уровень предметов по слотам и средний ilvl в окне персонажа и осмотра. Отмечает отсутствие чар, самоцветов, пряжки для пояса, гнезд от профессий, улучшений инженера, нарушения специализации брони и неполные улучшения предметов.
-## Version: 1.3
+## Version: 1.4
 ## IconTexture: Interface\AddOns\GearLensRu\GearLens_Icon
 ## Category: Character
 ## Category-ruRU: Персонаж
+## X-Curse-Project-ID: 1625028
 
 GearLensRu.lua
