@@ -1,6 +1,7 @@
 # Repo-only files: kept in git, excluded from `git archive` release packages
 .gitignore          export-ignore
 .gitattributes      export-ignore
+CLAUDE.md           export-ignore
 
 # The client cannot load PNG — GearLens_Icon.tga is what ## IconTexture uses in
 # game. The PNG exists only for the README on GitHub, so it is dead weight for
