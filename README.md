@@ -1,4 +1,4 @@
-<img src="GearLens_Icon.png" width="128" align="right" alt="GearLensRu">
+<img src="https://raw.githubusercontent.com/Firstgoer/GearLensRu/main/GearLens_Icon.png" width="128" align="right" alt="GearLensRu">
 
 # GearLensRu
 
