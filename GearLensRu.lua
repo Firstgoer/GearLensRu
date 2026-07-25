@@ -50,12 +50,13 @@ local ENCHANT_SLOTS = {
 }
 
 local SLOT_NAMES = {
-    [1]  = "Head",      [2]  = "Neck",      [3]  = "Shoulder",
-    [5]  = "Chest",     [6]  = "Waist",     [7]  = "Legs",
-    [8]  = "Feet",      [9]  = "Wrist",     [10] = "Hands",
-    [11] = "Ring 1",    [12] = "Ring 2",
-    [13] = "Trinket 1", [14] = "Trinket 2",
-    [15] = "Back",      [16] = "Main Hand", [17] = "Off Hand",
+    [1]  = "Голова",            [2]  = "Шея",                [3]  = "Плечи",
+    [5]  = "Грудь",             [6]  = "Пояс",               [7]  = "Ноги",
+    [8]  = "Ступни",            [9]  = "Запястья",           [10] = "Кисти рук",
+    [11] = "Первое кольцо",     [12] = "Второе кольцо",
+    [13] = "Первый аксессуар",  [14] = "Второй аксессуар",
+    [15] = "Спина",             [16] = "Правая рука",        [17] = "Левая рука",
+    [18] = "Дальний бой",
 }
 
 local EMPTY_SOCKET_TEXT = {
@@ -114,7 +115,7 @@ local ENG_TINKER_PATTERNS = {
     [15] = { "скорость падения" },                            -- Goblin Glider
 }
 local ENG_TINKER_NAMES = {
-    [6]  = "Никтоускорители",
+    [6]  = "Нитроускорители",
     [10] = "Нейронные пружины",
     [15] = "Гоблинский планер",
 }
@@ -664,43 +665,43 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
 
                         if data.emptyGems > 0 then
                             if data.emptyGems == 1 then
-                                table.insert(issues, "This item is missing 1 gem!")
+                                table.insert(issues, "Пустое гнездо для самоцвета.")
                             else
-                                table.insert(issues, "This item is missing " .. data.emptyGems .. " gems!")
+                                table.insert(issues, "Пустых гнезд для самоцветов: " .. data.emptyGems .. ".")
                             end
                         end
 
                         if data.outdatedGems > 0 then
                             if data.outdatedGems == 1 then
-                                table.insert(issues, "This item has an outdated gem!")
+                                table.insert(issues, "Устаревший самоцвет.")
                             else
-                                table.insert(issues, "This item has " .. data.outdatedGems .. " outdated gems!")
+                                table.insert(issues, "Устаревших самоцветов: " .. data.outdatedGems .. ".")
                             end
                         end
 
                         if data.lowQualityGems > 0 then
                             if data.lowQualityGems == 1 then
-                                table.insert(issues, "This item has a low quality gem!")
+                                table.insert(issues, "Самоцвет низкого качества.")
                             else
-                                table.insert(issues, "This item has " .. data.lowQualityGems .. " low quality gems!")
+                                table.insert(issues, "Самоцветов низкого качества: " .. data.lowQualityGems .. ".")
                             end
                         end
 
                         if slot == 6 and data.totalSockets == 0 then
-                            table.insert(issues, "This item is missing a Belt Buckle!")
+                            table.insert(issues, "Нет пряжки для пояса.")
                         end
 
                         if BS_SOCKET_SLOTS[slot] and unitIsBS then
                             local baseSockets = GetBaseSocketCount(data.link)
                             if data.totalSockets <= baseSockets then
-                                table.insert(issues, "This item is missing a Blacksmithing socket!")
+                                table.insert(issues, "Нет дополнительного гнезда (кузнечное дело).")
                             end
                         end
 
                         -- Enchanting: ring enchants (only enchanters can enchant rings)
                         if (slot == 11 or slot == 12) and unitIsEnchant
                         and not data.hasEnchant then
-                            table.insert(issues, "This item is not enchanted!")
+                            table.insert(issues, "Нет чар.")
                         end
 
                         -- Regular enchant check.
@@ -710,11 +711,11 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                             local skip = slot == 17
                                          and not (data.equipLoc and ENCHANTABLE_OH[data.equipLoc])
                             if not skip then
-                                table.insert(issues, "This item is not enchanted!")
+                                table.insert(issues, "Нет чар.")
                                 -- If they have the tinker but skipped the enchant, educate them.
                                 if ENG_TINKER_PATTERNS[slot] and data.hasEngTinker then
                                     table.insert(issues,
-                                        "Tinkers and enchants can both be applied to this slot!")
+                                        "На этот слот можно наложить и чары, и улучшение инженера.")
                                 end
                             end
                         end
@@ -725,7 +726,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                         if unitIsEngineer and ENG_TINKER_PATTERNS[slot] then
                             if not data.hasEngTinker then
                                 table.insert(issues,
-                                    "This item is missing " .. ENG_TINKER_NAMES[slot] .. "!")
+                                    "Нет улучшения инженера: " .. ENG_TINKER_NAMES[slot] .. ".")
                             end
                         end
 
@@ -734,7 +735,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                             if expectedArmor and data.armorType ~= expectedArmor
                             and data.armorType ~= "Miscellaneous" then
                                 table.insert(issues,
-                                    "This item breaks your Armor Specialization bonus!")
+                                    "Нарушен бонус специализации брони.")
                             end
                         end
 
@@ -742,7 +743,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                         if data.upgradeLevel and data.maxUpgrade
                         and data.upgradeLevel < data.maxUpgrade then
                             table.insert(issues, string.format(
-                                "This item has not been fully upgraded (%d/%d)!",
+                                "Предмет улучшен не полностью (%d/%d).",
                                 data.upgradeLevel, data.maxUpgrade))
                         end
 
@@ -752,7 +753,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                         and not IsPvPItem(data.name) then
                             local baseSockets = GetBaseSocketCount(data.link)
                             if data.totalSockets <= baseSockets then
-                                table.insert(issues, "This weapon is missing an Eye of the Black Prince socket!")
+                                table.insert(issues, "Нет гнезда от Ока Черного принца.")
                             end
                         end
 
@@ -764,7 +765,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                                 local _, _, gemQuality, _, _, _, gemSubType = GetItemInfo(gemID)
                                 if gemSubType and gemSubType:find("Meta", 1, true) then
                                     if (gemQuality or 0) < 5 then
-                                        table.insert(issues, "This helm is missing a Legendary meta gem!")
+                                        table.insert(issues, "Нет легендарного особого самоцвета.")
                                     end
                                     break  -- only one meta socket possible
                                 end
@@ -867,32 +868,27 @@ local function SetupInspectOverlay()
     inspectHide      = rawHide
     inspectGetIssues = rawGetIssues
 
-    -- Helper: strip leading "This <word> " so whisper/chat lines are concise
-    local function ShortIssue(s)
-        return (s:gsub("^This %a+ ", ""))
-    end
-
     -- ── Whisper Issues button ─────────────────────────────────────────────────
     local whisperBtn = CreateFrame("Button", nil, InspectFrame, "UIPanelButtonTemplate")
     whisperBtn:SetSize(110, 22)
     whisperBtn:SetFrameStrata("HIGH")
     whisperBtn:SetPoint("BOTTOMRIGHT", InspectFrame, "BOTTOMRIGHT", -8, 8)
-    whisperBtn:SetText("Whisper Issues")
+    whisperBtn:SetText("Шепнуть игроку")
     whisperBtn:Hide()
     whisperBtn:SetScript("OnClick", function()
         local allIssues = inspectGetIssues()
         if #allIssues == 0 then
-            print("|cFF00FF00GearLens:|r No gear issues found.")
+            print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
             return
         end
         local unit = (InspectFrame and InspectFrame.unit) or inspectUnit
         local name, realm = UnitName(unit)
         if not name then return end
         local target = (realm and realm ~= "") and (name .. "-" .. realm) or name
-        SendChatMessage("GearLens gear report:", "WHISPER", nil, target)
+        SendChatMessage("GearLens: отчет по снаряжению", "WHISPER", nil, target)
         for _, entry in ipairs(allIssues) do
             for _, issue in ipairs(entry.issues) do
-                SendChatMessage("[" .. entry.name .. "] " .. ShortIssue(issue), "WHISPER", nil, target)
+                SendChatMessage("[" .. entry.name .. "] " .. issue, "WHISPER", nil, target)
             end
         end
     end)
@@ -902,21 +898,21 @@ local function SetupInspectOverlay()
     reportBtn:SetSize(110, 22)
     reportBtn:SetFrameStrata("HIGH")
     reportBtn:SetPoint("BOTTOMLEFT", InspectFrame, "BOTTOMLEFT", 8, 8)
-    reportBtn:SetText("Report to Chat")
+    reportBtn:SetText("Отправить в чат")
     reportBtn:Hide()
     reportBtn:SetScript("OnClick", function()
         local allIssues = inspectGetIssues()
         if #allIssues == 0 then
-            print("|cFF00FF00GearLens:|r No gear issues found.")
+            print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
             return
         end
         local unit    = (InspectFrame and InspectFrame.unit) or inspectUnit
-        local name    = UnitName(unit) or "Unknown"
+        local name    = UnitName(unit) or "Неизвестно"
         local channel = GetChatChannel()
-        SendChatMessage("GearLens: " .. name .. " has gear issues:", channel)
+        SendChatMessage("GearLens: проблемы со снаряжением у " .. name .. ":", channel)
         for _, entry in ipairs(allIssues) do
             for _, issue in ipairs(entry.issues) do
-                SendChatMessage("[" .. entry.name .. "] " .. ShortIssue(issue), channel)
+                SendChatMessage("[" .. entry.name .. "] " .. issue, channel)
             end
         end
     end)
@@ -1077,7 +1073,7 @@ SlashCmdList["GEARLENSRU"] = function(msg)
         local patterns = ENG_TINKER_PATTERNS[slot]
         local link = GetInventoryItemLink("player", slot)
         if not link then
-            print(("|cFF00FF00GearLens:|r [%d] %s: (empty slot)"):format(slot, name))
+            print(("|cFF00FF00GearLens:|r [%d] %s: (слот пуст)"):format(slot, name))
         else
             local found = false
             for _, text in ipairs(GetInventoryTooltipLines("player", slot)) do
@@ -1089,8 +1085,8 @@ SlashCmdList["GEARLENSRU"] = function(msg)
                 end
                 if found then break end
             end
-            print(("|cFF00FF00GearLens:|r [%d] %s: tinker %s"):format(
-                slot, name, found and "|cFF00FF00FOUND|r" or "|cFFFF0000NOT FOUND|r"))
+            print(("|cFF00FF00GearLens:|r [%d] %s: улучшение %s"):format(
+                slot, name, found and "|cFF00FF00НАЙДЕНО|r" or "|cFFFF0000НЕ НАЙДЕНО|r"))
         end
     end
     -- Current (upgraded) vs base item level per equipped slot; upgraded ones marked.
@@ -1100,8 +1096,8 @@ SlashCmdList["GEARLENSRU"] = function(msg)
             local upgraded = data.baseIlvl and data.baseIlvl < data.ilvl
             print(("|cFF00FF00GearLens:|r [%d] ilvl cur=%s base=%s%s%s"):format(
                 slot, tostring(data.ilvl), tostring(data.baseIlvl),
-                upgraded and " |cFF00FF00(upgraded)|r" or "",
-                data.incompleteRead and " |cFFFF0000(incomplete read)|r" or ""))
+                upgraded and " |cFF00FF00(улучшен)|r" or "",
+                data.incompleteRead and " |cFFFF0000(неполное чтение)|r" or ""))
         end
     end
 end
