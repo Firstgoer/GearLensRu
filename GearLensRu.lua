@@ -386,9 +386,21 @@ local function ScanSlot(unit, slot)
     }
 end
 
+-- Returns (equipped average, maximum average). The caller shows the first number and
+-- appends "/second" only when the second is higher.
 local function GetAvgIlvlForUnit(unit)
     if unit == "player" and GetAverageItemLevel then
-        return GetAverageItemLevel()
+        -- GetAverageItemLevel() returns one average that counts the best items in bags
+        -- and one for what is actually worn. Returning them unswapped made the character
+        -- frame show the bag-inclusive figure while the inspect frame below shows an
+        -- equipped-only one, so the two frames could not be compared — and since the
+        -- worn average never exceeds the bag-inclusive one, the "/max" half never
+        -- appeared. Order the pair by value rather than by position: the average that
+        -- may draw on bags is by definition >= the one restricted to worn gear, so this
+        -- holds whichever order the client returns them in.
+        local a, b = GetAverageItemLevel()
+        if a and b then return math.min(a, b), math.max(a, b) end
+        return a or b or 0, a or b or 0
     end
     local total = 0
     local mainHandIlvl = 0
@@ -418,7 +430,10 @@ local function GetAvgIlvlForUnit(unit)
     if mainHandIlvl > 0 and not GetInventoryItemLink(unit, 17) then
         total = total + mainHandIlvl
     end
-    return total / 16, total / 16
+    -- Both values are the same on purpose: only equipped gear is visible on an
+    -- inspected unit, so there is no separate maximum and the caller shows one number.
+    local avg = total / 16
+    return avg, avg
 end
 
 -- ── Profession helpers ────────────────────────────────────────────────────────
@@ -640,8 +655,41 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
 
         -- Hoist per-unit constants out of the slot loop
         local unitIsPlayer  = (unit == "player")
-        local unitIsBS      = unitIsPlayer and IsBlacksmith()
+        -- Blacksmithing detection, same idea. The profession adds an extra socket to
+        -- wrists or hands, so more gems in the link than the item has base sockets
+        -- proves it. Link-based like the ring check below, but it can only see a
+        -- socket that has been filled: an empty blacksmith socket appears solely in
+        -- the tooltip. So a blacksmith who gemmed one of the two slots and left the
+        -- other bare is detected and warned about, while one who left both bare is
+        -- indistinguishable from a non-blacksmith and is not warned.
+        local unitIsBS = unitIsPlayer and IsBlacksmith()
+        if not unitIsBS then
+            for bsSlot in pairs(BS_SOCKET_SLOTS) do
+                local bsLink = GetInventoryItemLink(unit, bsSlot)
+                if bsLink and #GetFilledGemIDs(bsLink) > GetBaseSocketCount(bsLink) then
+                    unitIsBS = true
+                    break
+                end
+            end
+        end
+
+        -- Enchanting detection, same idea as engineering above. Ring enchants are
+        -- enchanter-only in MoP, so an enchant on either ring proves the profession
+        -- and means the other ring should carry one too. Unlike the tinker scan this
+        -- reads the item link, not the tooltip, so it cannot be fooled by an
+        -- incomplete read. If neither ring is enchanted nothing is inferred and no
+        -- warning is raised — an unenchanted pair is indistinguishable from a
+        -- non-enchanter.
         local unitIsEnchant = unitIsPlayer and IsEnchanter()
+        if not unitIsEnchant then
+            for _, ringSlot in ipairs({ 11, 12 }) do
+                local ringLink = GetInventoryItemLink(unit, ringSlot)
+                if ringLink and GetEnchantFromLink(ringLink) ~= 0 then
+                    unitIsEnchant = true
+                    break
+                end
+            end
+        end
         local _, unitClass  = UnitClass(unit)
         local expectedArmor = unitClass and CLASS_ARMOR[unitClass]
 
@@ -959,11 +1007,16 @@ local function SetupInspectOverlay()
     -- Wrap the raw refresh so both buttons are shown/hidden based on issue state
     local function doRefresh()
         rawRefresh()
-        local hasIssues = #inspectGetIssues() > 0
-        local gearTab   = InspectPaperDollFrame and InspectPaperDollFrame:IsShown()
-        local show      = hasIssues and gearTab
-        whisperBtn:SetShown(show)
-        reportBtn:SetShown(show)
+        -- Visibility follows the gear tab alone, not the issue count. Deriving it from
+        -- issues made both buttons flicker on for about a second whenever a player was
+        -- inspected: the first scan runs before the tooltip data has settled, reports
+        -- issues that are not real, and the settled re-scan then hides them again.
+        -- With nothing to report a click is harmless — it prints
+        -- "Проблем со снаряжением не найдено." and sends nothing.
+        local gearTab = (InspectPaperDollFrame and InspectPaperDollFrame:IsShown())
+                        and true or false
+        whisperBtn:SetShown(gearTab)
+        reportBtn:SetShown(gearTab)
     end
     inspectRefresh = doRefresh
 

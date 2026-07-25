@@ -130,5 +130,13 @@ after it was created, orphaning a tag that pointed at the pre-reword hash. Verif
   the above. That would also retire the Russian-only `EMPTY_SOCKET_TEXT` table
   and take the belt buckle and blacksmithing checks off the fragile path.
 - `CHANGELOG.md` is Russian only.
-- `GetAvgIlvlForUnit` returns `total/16` twice for non-player units, so the
-  "equipped / max" split can never show for an inspected player.
+
+## Fixed, kept as a note
+
+`GetAvgIlvlForUnit` returning `total/16` twice for an inspected unit looked like
+a bug but is correct — bags are not visible, so there is no separate maximum.
+The real defect was on the player branch: `GetAverageItemLevel()` returns a
+bag-inclusive average and a worn-only one, and passing them through unswapped
+made the character frame show a different metric from the inspect frame. It now
+orders the pair with `math.min`/`math.max`, which is correct whichever order the
+client returns them in.
