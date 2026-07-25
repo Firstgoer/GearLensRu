@@ -1,0 +1,6 @@
+## Interface: 50504
+## Title: GearLensRu
+## Notes: Displays per-slot item levels and average ilvl on the Character and Inspect frames. Flags missing enchants, gems, belt buckles, profession sockets, tinkers, armor specialization violations, and incomplete upgrades.
+## Version: 1.0
+
+GearLensRu.lua
