@@ -1,0 +1,3 @@
+# Repo-only files: kept in git, excluded from `git archive` release packages
+.gitignore      export-ignore
+.gitattributes  export-ignore
