@@ -120,32 +120,28 @@ local ENG_TINKER_NAMES = {
     [15] = "Гоблинский планер",
 }
 
+-- Bounded self-heal for incomplete tooltip reads. 12 x 0.4s ≈ 5s covers the window
+-- after a cold client start where the server has not yet delivered item data; late
+-- arrivals beyond it are picked up by GET_ITEM_INFO_RECEIVED.
+local RETRY_LIMIT = 12
+local RETRY_DELAY = 0.4
+
 -- ── Scan tooltip ──────────────────────────────────────────────────────────────
 
 local scanTip = CreateFrame("GameTooltip", "GearLensScanTip", UIParent, "GameTooltipTemplate")
-scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
--- ── Tooltip readers ─────────────────────────────────────────────────────────────
--- Scraping a hidden, never-shown GameTooltip's FontStrings (SetInventoryItem +
--- GearLensScanTipTextLeftN:GetText()) is unreliable on the modern client: it can
--- intermittently omit dynamically-appended lines (e.g. an engineering tinker's
--- "Use:" line) even when the item is fully cached, producing false "missing tinker"
--- warnings that only a /reload clears. C_TooltipInfo reads the authoritative tooltip
--- data provider directly and does not depend on a rendered frame, so we prefer it and
--- keep the legacy scrape only as a fallback for clients without the API.
--- Both helpers return a DENSE array of left-text strings (blank lines become ""),
--- so callers can iterate with ipairs without a nil hole truncating the scan early.
-local function GetInventoryTooltipLines(unit, slot)
+-- Populate the scan tooltip and return its left-hand text lines.
+-- SetOwner is called before EVERY read, not once at load. A scan tooltip that is only
+-- ClearLines()'d between reads works at first and degrades later in the session, after
+-- which SetInventoryItem populates fewer lines — or none. That matches the observed
+-- symptom exactly: correct for a while, then persistently wrong until a /reload, which
+-- recreates this frame. A /reload does NOT refill the client's item cache, so a stale
+-- cache cannot be what /reload was fixing. SetOwner also clears the previous lines,
+-- which is why no separate ClearLines() call is needed.
+local function ReadScanTip(method, a, b)
+    scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
+    scanTip[method](scanTip, a, b)
     local out = {}
-    if C_TooltipInfo and C_TooltipInfo.GetInventoryItem then
-        local data = C_TooltipInfo.GetInventoryItem(unit, slot)
-        if data and data.lines then
-            for _, row in ipairs(data.lines) do out[#out + 1] = row.leftText or "" end
-            return out
-        end
-    end
-    scanTip:ClearLines()
-    scanTip:SetInventoryItem(unit, slot)
     for i = 1, scanTip:NumLines() do
         local o = _G["GearLensScanTipTextLeft" .. i]
         out[#out + 1] = (o and o:GetText()) or ""
@@ -153,22 +149,51 @@ local function GetInventoryTooltipLines(unit, slot)
     return out
 end
 
-local function GetHyperlinkTooltipLines(link)
-    local out = {}
-    if C_TooltipInfo and C_TooltipInfo.GetHyperlink then
-        local data = C_TooltipInfo.GetHyperlink(link)
+-- A populated item tooltip always carries at least a name line and one detail line.
+-- Anything shorter means it did not populate at all, so re-own and read once more
+-- before believing an empty result.
+local function ScanLines(method, a, b)
+    local out = ReadScanTip(method, a, b)
+    if #out < 2 then out = ReadScanTip(method, a, b) end
+    return out
+end
+
+-- ── Tooltip readers ─────────────────────────────────────────────────────────────
+-- MoP Classic (5.5.4) does NOT expose C_TooltipInfo — "/glr diag" reports it as nil —
+-- so in practice every read here goes through the legacy FontString scrape. The
+-- C_TooltipInfo branch is kept for clients that do have the API, where it reads the
+-- authoritative data provider without depending on a rendered frame.
+-- The scrape itself is sound: it returns every line the tooltip has. What it cannot do
+-- is invent lines the client has not received yet. Before the server delivers an item's
+-- data the tooltip is short or truncated — the "Использование:" line of an engineering
+-- tinker can be absent while the item's own "Уровень предмета" line is already there —
+-- so a scan taken in that window silently under-reports. Callers must treat an
+-- incomplete read as retryable (see RETRY_LIMIT and GET_ITEM_INFO_RECEIVED) rather
+-- than as "the item has no tinker/socket/upgrade".
+-- Both helpers return a DENSE array of left-text strings (blank lines become ""),
+-- so callers can iterate with ipairs without a nil hole truncating the scan early.
+local function GetInventoryTooltipLines(unit, slot)
+    if C_TooltipInfo and C_TooltipInfo.GetInventoryItem then
+        local data = C_TooltipInfo.GetInventoryItem(unit, slot)
         if data and data.lines then
+            local out = {}
             for _, row in ipairs(data.lines) do out[#out + 1] = row.leftText or "" end
             return out
         end
     end
-    scanTip:ClearLines()
-    scanTip:SetHyperlink(link)
-    for i = 1, scanTip:NumLines() do
-        local o = _G["GearLensScanTipTextLeft" .. i]
-        out[#out + 1] = (o and o:GetText()) or ""
+    return ScanLines("SetInventoryItem", unit, slot)
+end
+
+local function GetHyperlinkTooltipLines(link)
+    if C_TooltipInfo and C_TooltipInfo.GetHyperlink then
+        local data = C_TooltipInfo.GetHyperlink(link)
+        if data and data.lines then
+            local out = {}
+            for _, row in ipairs(data.lines) do out[#out + 1] = row.leftText or "" end
+            return out
+        end
     end
-    return out
+    return ScanLines("SetHyperlink", link)
 end
 
 -- Sticky last-known-good tinker detection. Engineering tinkers do NOT alter the item
@@ -628,6 +653,17 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                 local data = ScanSlot(unit, slot)
                 if data and data.incompleteRead then anyIncomplete = true end
 
+                -- A tooltip can be truncated rather than absent: after a cold client
+                -- start the item's own lines ("Уровень предмета") are present while the
+                -- tinker's "Использование:" line, which needs the enchant's spell data,
+                -- is not yet. That read looks complete but yields a false "no tinker"
+                -- warning. Treat an unseen tinker on an engineer's tinker slot as
+                -- incomplete too, so the bounded retry keeps looking instead of warning.
+                if data and unitIsEngineer and ENG_TINKER_PATTERNS[slot]
+                and not data.hasEngTinker then
+                    anyIncomplete = true
+                end
+
                 -- Ilvl chip
                 if data and data.ilvl and data.ilvl > 0 then
                     local c = QUALITY_COLOR[data.quality] or QUALITY_COLOR[1]
@@ -701,7 +737,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                         -- Enchanting: ring enchants (only enchanters can enchant rings)
                         if (slot == 11 or slot == 12) and unitIsEnchant
                         and not data.hasEnchant then
-                            table.insert(issues, "Нет чар.")
+                            table.insert(issues, "Отсутсвуют чары.")
                         end
 
                         -- Regular enchant check.
@@ -711,7 +747,7 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                             local skip = slot == 17
                                          and not (data.equipLoc and ENCHANTABLE_OH[data.equipLoc])
                             if not skip then
-                                table.insert(issues, "Нет чар.")
+                                table.insert(issues, "Отсутсвуют чары.")
                                 -- If they have the tinker but skipped the enchant, educate them.
                                 if ENG_TINKER_PATTERNS[slot] and data.hasEngTinker then
                                     table.insert(issues,
@@ -794,13 +830,16 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
             -- If any equipped slot returned an incomplete tooltip read, the async
             -- data provider wasn't ready yet. Re-scan shortly (bounded) so the frame
             -- self-heals to correct values without needing a /reload.
-            if anyIncomplete and retryCount < 6 then
+            -- The budget covers a cold client start, where server item data can take
+            -- several seconds to arrive; 6 x 0.3s was too short and left the cold read
+            -- standing. GET_ITEM_INFO_RECEIVED catches anything slower than this.
+            if anyIncomplete and retryCount < RETRY_LIMIT then
                 retryCount = retryCount + 1
                 retryFrame = retryFrame or CreateFrame("Frame")
                 local waited = 0
                 retryFrame:SetScript("OnUpdate", function(self, dt)
                     waited = waited + dt
-                    if waited >= 0.3 then
+                    if waited >= RETRY_DELAY then
                         self:SetScript("OnUpdate", nil)
                         Refresh()
                     end
@@ -994,10 +1033,41 @@ loader:SetScript("OnEvent", function(_, event, arg1)
                 end)
             end
 
+            -- GET_ITEM_INFO_RECEIVED fires once the server delivers data for an item
+            -- that GetItemInfo had to request. Until it arrives the equipped item's
+            -- tooltip is short or truncated, so a scan taken during that window misses
+            -- the ilvl, upgrade, socket and tinker lines. It arrives in bursts (bags,
+            -- bank, other players' gear), so coalesce into one re-scan.
+            local itemDataFrame, itemDataPending
+            local function ScheduleItemDataRefresh()
+                if itemDataPending then return end
+                itemDataPending = true
+                itemDataFrame = itemDataFrame or CreateFrame("Frame")
+                local waited = 0
+                itemDataFrame:SetScript("OnUpdate", function(self, dt)
+                    waited = waited + dt
+                    if waited >= 0.3 then
+                        self:SetScript("OnUpdate", nil)
+                        itemDataPending = false
+                        if CharacterFrame and CharacterFrame:IsShown() and charRefresh then
+                            charRefresh()
+                        end
+                        if InspectFrame and InspectFrame:IsShown() and inspectRefresh then
+                            inspectRefresh()
+                        end
+                    end
+                end)
+            end
+
             local evtFrame = CreateFrame("Frame")
             evtFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
             evtFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+            evtFrame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
             evtFrame:SetScript("OnEvent", function(_, event, arg1)
+                if event == "GET_ITEM_INFO_RECEIVED" then
+                    ScheduleItemDataRefresh()
+                    return
+                end
                 -- UNIT_INVENTORY_CHANGED fires for any unit; only react to the player.
                 if event == "UNIT_INVENTORY_CHANGED" and arg1 ~= "player" then return end
                 ScheduleCharRefresh()
@@ -1061,11 +1131,89 @@ end)
 
 -- ── Debug slash command ─────────────────────────────────────────────────────────
 -- "/glr" dumps tinker-line readability for the three engineering slots and the
--- current-vs-base item level for every equipped slot. Use it to confirm the
--- C_TooltipInfo path works (run before any /reload) or to diagnose a recurrence.
+-- current-vs-base item level for every equipped slot.
+-- "/glr diag" adds the evidence behind a wrong result: line counts, the actual
+-- "Использование:"/"Уровень ..." lines and each tinker pattern's match result.
+-- "/glr dump <slot>" prints every tooltip line for one slot.
+-- Neither retries, so both report the raw current state — run them right after a
+-- cold client start to see an incomplete read, not after a /reload (which keeps the
+-- client's item cache warm and therefore cannot reproduce it).
 SLASH_GEARLENSRU1 = "/glr"
 SlashCmdList["GEARLENSRU"] = function(msg)
     local usingCTI = (C_TooltipInfo and C_TooltipInfo.GetInventoryItem) and true or false
+    local cmd, arg = (msg or ""):lower():match("^%s*(%a*)%s*(%d*)")
+
+    -- "/glr diag": the decisive evidence in one paste. For each tinker slot it shows
+    -- how many lines the scan returned, every "Использование:" line found, and the
+    -- per-pattern match result; for the ilvl slots, every "Уровень ..." line found.
+    -- Substrings are matched without their first letter so a Cyrillic capital that
+    -- string.lower() cannot fold does not hide the line from this diagnostic itself.
+    if cmd == "diag" then
+        local owner = scanTip:GetOwner()
+        print(("|cFF00FF00GearLens:|r C_TooltipInfo=%s  владелец подсказки=%s  показана=%s")
+            :format(type(C_TooltipInfo),
+                    owner and (owner:GetName() or "без имени") or "|cFFFF0000нет|r",
+                    tostring(scanTip:IsShown())))
+        for _, slot in ipairs({ 6, 10, 15, 1, 8 }) do
+            local link = GetInventoryItemLink("player", slot)
+            if not link then
+                print(("|cFF00FF00GearLens:|r [%d] слот пуст"):format(slot))
+            else
+                local lines = GetInventoryTooltipLines("player", slot)
+                local hits, blank = 0, 0
+                for _, text in ipairs(lines) do
+                    if text == "" then blank = blank + 1 end
+                end
+                -- Blank count separates "the scan returned nothing" from "the scan
+                -- returned line slots whose FontStrings had no text" — different faults.
+                print(("|cFF00FF00GearLens:|r [%d] строк: %d  пустых: %d  NumLines()=%s")
+                    :format(slot, #lines, blank, tostring(scanTip:NumLines())))
+                for i = 1, math.min(3, #lines) do
+                    print(("  сырая %d: [%s]"):format(i, lines[i]))
+                end
+                for i, text in ipairs(lines) do
+                    if text ~= "" and (text:find("спользован", 1, true)
+                                    or text:find("ровень предмета", 1, true)
+                                    or text:find("ровень улучшения", 1, true)) then
+                        hits = hits + 1
+                        print(("  %d: [%s]"):format(i, text))
+                    end
+                end
+                if hits == 0 then print("  (нет строк 'Использование:' / 'Уровень ...')") end
+                for _, pat in ipairs(ENG_TINKER_PATTERNS[slot] or {}) do
+                    local found = false
+                    for _, text in ipairs(lines) do
+                        if text:lower():find(pat, 1, true) then found = true; break end
+                    end
+                    print(("  pat '%s...' -> %s"):format(pat:sub(1, 24), tostring(found)))
+                end
+            end
+        end
+        return
+    end
+
+    -- "/glr dump <slot>": raw tooltip lines for one equipped slot, exactly as the
+    -- scanner sees them. This is the evidence for why a line was or was not matched.
+    if cmd == "dump" then
+        local slot = tonumber(arg)
+        if not slot then
+            print("|cFF00FF00GearLens:|r Использование: /glr dump <номер слота>")
+            return
+        end
+        if not GetInventoryItemLink("player", slot) then
+            print(("|cFF00FF00GearLens:|r [%d] слот пуст"):format(slot))
+            return
+        end
+        local lines = GetInventoryTooltipLines("player", slot)
+        print(("|cFF00FF00GearLens:|r [%d] строк: %d  путь: %s  NumLines()=%s")
+            :format(slot, #lines, usingCTI and "C_TooltipInfo" or "scrape",
+                    tostring(scanTip:NumLines())))
+        for i, text in ipairs(lines) do
+            print(("  %d: [%s]"):format(i, tostring(text)))
+        end
+        return
+    end
+
     print(("|cFF00FF00GearLens:|r Engineer=%s  C_TooltipInfo=%s")
         :format(tostring(IsEngineer()), tostring(usingCTI)))
     for _, slot in ipairs({ 6, 10, 15 }) do
