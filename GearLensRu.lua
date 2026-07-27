@@ -478,6 +478,392 @@ local function GetBaseSocketCount(link)
     return count
 end
 
+-- Pure, UI-independent gear evaluation for a unit. Used by both the
+-- Character/Inspect overlay (via SetupOverlay's Refresh) and the party/raid
+-- roster window. Calls ScanSlot exactly once per slot; callers get the raw
+-- ScanSlot data back alongside the derived issue list so they don't have to
+-- re-scan for ilvl-chip rendering.
+local function EvaluateUnit(unit)
+    local equipped, maxLvl = GetAvgIlvlForUnit(unit)
+
+    -- Engineering detection.
+    -- Own character: use the profession API directly — no scanning needed.
+    -- Inspected player: we can't call GetProfessions() on them, so we do a
+    -- lightweight scan of the 3 tinker slots only. A tinker on any one of
+    -- them proves engineering. The main loop below re-scans each slot
+    -- independently via ScanSlot, so this preliminary scan doesn't interfere.
+    local unitIsEngineer = (unit == "player") and IsEngineer()
+    if not unitIsEngineer then
+        for slot, patterns in pairs(ENG_TINKER_PATTERNS) do
+            local link = GetInventoryItemLink(unit, slot)
+            if link then
+                for _, text in ipairs(GetInventoryTooltipLines(unit, slot)) do
+                    if text then
+                        local textLower = text:lower()
+                        for _, pat in ipairs(patterns) do
+                            if textLower:find(pat, 1, true) then
+                                unitIsEngineer = true
+                                break
+                            end
+                        end
+                    end
+                    if unitIsEngineer then break end
+                end
+            end
+            if unitIsEngineer then break end
+        end
+    end
+
+    local unitIsPlayer = (unit == "player")
+    -- Blacksmithing detection, same idea. The profession adds an extra socket
+    -- to wrists or hands, so more gems in the link than the item has base
+    -- sockets proves it.
+    local unitIsBS = unitIsPlayer and IsBlacksmith()
+    if not unitIsBS then
+        for bsSlot in pairs(BS_SOCKET_SLOTS) do
+            local bsLink = GetInventoryItemLink(unit, bsSlot)
+            if bsLink and #GetFilledGemIDs(bsLink) > GetBaseSocketCount(bsLink) then
+                unitIsBS = true
+                break
+            end
+        end
+    end
+
+    -- Enchanting detection, same idea as engineering above.
+    local unitIsEnchant = unitIsPlayer and IsEnchanter()
+    if not unitIsEnchant then
+        for _, ringSlot in ipairs({ 11, 12 }) do
+            local ringLink = GetInventoryItemLink(unit, ringSlot)
+            if ringLink and GetEnchantFromLink(ringLink) ~= 0 then
+                unitIsEnchant = true
+                break
+            end
+        end
+    end
+
+    local _, unitClass  = UnitClass(unit)
+    local expectedArmor = unitClass and CLASS_ARMOR[unitClass]
+
+    local anyIncomplete = false
+    local slots = {}
+
+    for _, info in ipairs(SLOT_BUTTONS) do
+        local slot = info.id
+        local data = ScanSlot(unit, slot)
+        local issues = {}
+
+        if data then
+            if data.incompleteRead then anyIncomplete = true end
+
+            -- A tooltip can be truncated rather than absent: after a cold
+            -- client start the item's own lines ("Уровень предмета") are
+            -- present while the tinker's "Использование:" line, which needs
+            -- the enchant's spell data, is not yet. Treat an unseen tinker on
+            -- an engineer's tinker slot as incomplete too, so the bounded
+            -- retry keeps looking instead of warning.
+            if unitIsEngineer and ENG_TINKER_PATTERNS[slot] and not data.hasEngTinker then
+                anyIncomplete = true
+            end
+
+            -- In some clients GetInventoryItemLink(unit, 17) returns the 2H
+            -- weapon link when no off-hand is equipped. Skip all checks then.
+            if slot == 17 and data.equipLoc == "INVTYPE_2HWEAPON" then
+                issues = {}
+            else
+                if data.emptyGems > 0 then
+                    if data.emptyGems == 1 then
+                        table.insert(issues, "Пустое гнездо для самоцвета.")
+                    else
+                        table.insert(issues, "Пустых гнезд для самоцветов: " .. data.emptyGems .. ".")
+                    end
+                end
+
+                if data.outdatedGems > 0 then
+                    if data.outdatedGems == 1 then
+                        table.insert(issues, "Устаревший самоцвет.")
+                    else
+                        table.insert(issues, "Устаревших самоцветов: " .. data.outdatedGems .. ".")
+                    end
+                end
+
+                if data.lowQualityGems > 0 then
+                    if data.lowQualityGems == 1 then
+                        table.insert(issues, "Самоцвет низкого качества.")
+                    else
+                        table.insert(issues, "Самоцветов низкого качества: " .. data.lowQualityGems .. ".")
+                    end
+                end
+
+                if slot == 6 and data.totalSockets == 0 then
+                    table.insert(issues, "Нет пряжки для пояса.")
+                end
+
+                if BS_SOCKET_SLOTS[slot] and unitIsBS then
+                    local baseSockets = GetBaseSocketCount(data.link)
+                    if data.totalSockets <= baseSockets then
+                        table.insert(issues, "Нет дополнительного гнезда (кузнечное дело).")
+                    end
+                end
+
+                if (slot == 11 or slot == 12) and unitIsEnchant and not data.hasEnchant then
+                    table.insert(issues, "Отсутсвуют чары.")
+                end
+
+                if ENCHANT_SLOTS[slot] and not data.hasEnchant then
+                    local skip = slot == 17
+                                 and not (data.equipLoc and ENCHANTABLE_OH[data.equipLoc])
+                    if not skip then
+                        table.insert(issues, "Отсутсвуют чары.")
+                        if ENG_TINKER_PATTERNS[slot] and data.hasEngTinker then
+                            table.insert(issues,
+                                "На этот слот можно наложить и чары, и улучшение инженера.")
+                        end
+                    end
+                end
+
+                if unitIsEngineer and ENG_TINKER_PATTERNS[slot] then
+                    if not data.hasEngTinker then
+                        table.insert(issues,
+                            "Нет улучшения инженера: " .. ENG_TINKER_NAMES[slot] .. ".")
+                    end
+                end
+
+                if ARMOR_SPEC_SLOTS[slot] and data.armorType then
+                    if expectedArmor and data.armorType ~= expectedArmor
+                    and data.armorType ~= "Miscellaneous" then
+                        table.insert(issues, "Нарушен бонус специализации брони.")
+                    end
+                end
+
+                if data.upgradeLevel and data.maxUpgrade
+                and data.upgradeLevel < data.maxUpgrade then
+                    table.insert(issues, string.format(
+                        "Предмет улучшен не полностью (%d/%d).",
+                        data.upgradeLevel, data.maxUpgrade))
+                end
+
+                if EYE_WEAPON_EQUIPLOC[data.equipLoc]
+                and data.ilvl and data.ilvl >= EYE_MIN_ILVL and data.ilvl <= EYE_MAX_ILVL
+                and not IsPvPItem(data.name) then
+                    local baseSockets = GetBaseSocketCount(data.link)
+                    if data.totalSockets <= baseSockets then
+                        table.insert(issues, "Нет гнезда от Ока Черного принца.")
+                    end
+                end
+
+                if slot == 1
+                and data.ilvl and data.ilvl >= META_MIN_ILVL and data.ilvl <= META_MAX_ILVL
+                and not IsPvPItem(data.name) then
+                    for _, gemID in ipairs(data.gemIDs) do
+                        local _, _, gemQuality, _, _, _, gemSubType = GetItemInfo(gemID)
+                        if gemSubType and gemSubType:find("Meta", 1, true) then
+                            if (gemQuality or 0) < 5 then
+                                table.insert(issues, "Нет легендарного особого самоцвета.")
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
+        slots[slot] = {
+            data   = data,
+            name   = SLOT_NAMES[slot] or ("Slot " .. slot),
+            issues = issues,
+        }
+    end
+
+    return {
+        avgIlvl       = equipped,
+        maxIlvl       = maxLvl,
+        isEngineer    = unitIsEngineer,
+        isBS          = unitIsBS,
+        isEnchanter   = unitIsEnchant,
+        anyIncomplete = anyIncomplete,
+        slots         = slots,
+    }
+end
+
+-- Returns every unit token in the player's current group, "player" first
+-- (raid tokens already include the player, so they aren't duplicated).
+local function GetGroupUnits()
+    if IsInRaid() then
+        local units = {}
+        for i = 1, GetNumGroupMembers() do
+            table.insert(units, "raid" .. i)
+        end
+        return units
+    end
+    local units = { "player" }
+    if IsInGroup() then
+        for i = 1, GetNumGroupMembers() - 1 do
+            table.insert(units, "party" .. i)
+        end
+    end
+    return units
+end
+
+-- Whether `unit` can be inspected right now: connected, within inspect range
+-- (distance index 1 — see Wowpedia's CheckInteractDistance), and permitted by
+-- CanInspect (e.g. not an invalid target). Covers "different zone/instance"
+-- too, since CheckInteractDistance returns false for a unit that isn't
+-- loaded client-side.
+local function IsUnitInspectable(unit)
+    if UnitIsUnit(unit, "player") then return true end
+    if not UnitExists(unit) or not UnitIsConnected(unit) then return false end
+    if not CheckInteractDistance(unit, 1) then return false end
+    return CanInspect(unit) and true or false
+end
+
+-- ── Party/raid roster scan ────────────────────────────────────────────────────
+-- Throttled NotifyInspect queue: one request in flight at a time, a fixed
+-- delay between requests (mirrors how other inspect-based addons avoid the
+-- server silently ignoring rapid-fire NotifyInspect calls), and a bounded
+-- self-heal timeout if INSPECT_READY never arrives (member went out of range
+-- or offline mid-request).
+
+local ROSTER_INSPECT_TIMEOUT = 3   -- seconds to wait for INSPECT_READY
+local ROSTER_INSPECT_DELAY   = 1   -- seconds between successive NotifyInspect calls
+
+local rosterState  = {}   -- UnitGUID(unit) -> "pending" | "scanning" | "far" | "done"
+local rosterEval   = {}   -- UnitGUID(unit) -> EvaluateUnit(unit) result
+local rosterRetryCount = {} -- UnitGUID(unit) -> retries used on the current incomplete read
+local rosterQueue  = {}   -- ordered array of unit tokens still to process
+local rosterOnUpdate        -- callback(unit) fired whenever a unit's state changes
+-- unit token currently waiting on INSPECT_READY, or nil. NOTE: INSPECT_READY is a
+-- single global event with no unit payload, so a manual Blizzard-UI inspect fired
+-- while the roster scan is mid-flight can be misattributed to this unit — see the
+-- "Known limitation" entries in docs/superpowers/plans/2026-07-26-party-raid-gear-check.md.
+local rosterInspectWaiting
+local rosterTimer            -- single reusable timer frame
+local rosterBusy = false     -- true whenever the queue has more work coming
+
+-- GUIDs are stable across raid-index reshuffles; unit tokens (e.g. "raid5")
+-- are not, so all persistent state is keyed by GUID rather than by token.
+local function RosterKey(unit)
+    return UnitGUID(unit) or unit
+end
+
+local function RosterSetState(unit, state)
+    rosterState[RosterKey(unit)] = state
+    if rosterOnUpdate then rosterOnUpdate(unit) end
+end
+
+local function RosterAfterDelay(delay, fn)
+    rosterTimer = rosterTimer or CreateFrame("Frame")
+    local waited = 0
+    rosterTimer:SetScript("OnUpdate", function(self, dt)
+        waited = waited + dt
+        if waited >= delay then
+            self:SetScript("OnUpdate", nil)
+            fn()
+        end
+    end)
+end
+
+local RosterProcessNext  -- forward declaration; RosterInspectUnit calls it back
+
+local function RosterInspectUnit(unit)
+    RosterSetState(unit, "scanning")
+    rosterInspectWaiting = unit
+    NotifyInspect(unit)
+    RosterAfterDelay(ROSTER_INSPECT_TIMEOUT, function()
+        if rosterInspectWaiting ~= unit then return end -- INSPECT_READY got there first
+        rosterInspectWaiting = nil
+        RosterSetState(unit, "far")
+        RosterProcessNext()
+    end)
+end
+
+-- Records unit's EvaluateUnit() result, and retries (bounded, same RETRY_LIMIT/
+-- RETRY_DELAY window SetupOverlay's Refresh() uses for the same symptom — see
+-- "The scan tooltip" in CLAUDE.md) if the read came back incomplete, rather than
+-- settling for "done" on a cold-cache tooltip scrape. No re-inspect is needed for
+-- the retry: the item data is already cached client-side from the original
+-- NotifyInspect (or is the player's own gear), so re-running EvaluateUnit after a
+-- short delay is enough for the tooltip scan to self-heal.
+local function RosterEvaluateAndRetry(unit)
+    local key = RosterKey(unit)
+    local eval = EvaluateUnit(unit)
+    rosterEval[key] = eval
+    if eval.anyIncomplete and (rosterRetryCount[key] or 0) < RETRY_LIMIT then
+        rosterRetryCount[key] = (rosterRetryCount[key] or 0) + 1
+        RosterAfterDelay(RETRY_DELAY, function() RosterEvaluateAndRetry(unit) end)
+        return
+    end
+    rosterRetryCount[key] = nil
+    RosterSetState(unit, "done")
+    RosterAfterDelay(ROSTER_INSPECT_DELAY, RosterProcessNext)
+end
+
+RosterProcessNext = function()
+    local unit = table.remove(rosterQueue, 1)
+    if not unit then
+        rosterBusy = false
+        return
+    end
+
+    if UnitIsUnit(unit, "player") then
+        RosterEvaluateAndRetry(unit)
+        return
+    end
+
+    if not IsUnitInspectable(unit) then
+        RosterSetState(unit, "far")
+        RosterProcessNext()
+        return
+    end
+
+    RosterInspectUnit(unit)
+end
+
+-- Call from the INSPECT_READY event handler. No-ops if nothing is waiting.
+function GearLensRosterOnInspectReady()
+    local unit = rosterInspectWaiting
+    if not unit then return end
+    rosterInspectWaiting = nil
+    RosterEvaluateAndRetry(unit)
+end
+
+-- Starts (or restarts) a full scan of `units`, in order, discarding any
+-- previous scan's state. `onUpdate(unit)` fires whenever a unit's state
+-- changes, so the roster window can refresh that one row.
+function GearLensRosterStartScan(units, onUpdate)
+    rosterQueue = {}
+    for _, u in ipairs(units) do table.insert(rosterQueue, u) end
+    rosterOnUpdate = onUpdate
+    rosterInspectWaiting = nil
+    if rosterTimer then rosterTimer:SetScript("OnUpdate", nil) end
+    for _, u in ipairs(units) do
+        RosterSetState(u, "pending")
+    end
+    rosterBusy = true
+    RosterProcessNext()
+end
+
+-- Stops the queue without discarding already-collected results, so closing
+-- the roster window mid-scan doesn't keep sending inspect requests in the
+-- background.
+function GearLensRosterStopScan()
+    rosterQueue = {}
+    rosterInspectWaiting = nil
+    rosterBusy = false
+    if rosterTimer then rosterTimer:SetScript("OnUpdate", nil) end
+end
+
+-- Re-queues a single unit at the front of the line (the roster window's
+-- per-row Recheck button). If the queue is idle, processing starts right
+-- away; otherwise it's picked up as soon as the request ahead of it finishes.
+function GearLensRosterRecheckUnit(unit)
+    RosterSetState(unit, "pending")
+    table.insert(rosterQueue, 1, unit)
+    if not rosterBusy then
+        rosterBusy = true
+        RosterProcessNext()
+    end
+end
+
 -- ── UI helpers ────────────────────────────────────────────────────────────────
 
 -- Solid-colour texture using WHITE8X8 (available since vanilla, no API version risk)
@@ -614,10 +1000,11 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
     local retryCount = 0
     local function Refresh()
         local unit = getUnit()
-        local anyIncomplete = false
+        local evalResult = EvaluateUnit(unit)
+        local anyIncomplete = evalResult.anyIncomplete
 
         -- Average ilvl badge
-        local equipped, maxLvl = GetAvgIlvlForUnit(unit)
+        local equipped, maxLvl = evalResult.avgIlvl, evalResult.maxIlvl
         if maxLvl and maxLvl > equipped + 0.05 then
             ilvlLabel:SetFormattedText(
                 "|cFF00FF00%.1f|r|cFFAAAAAA/%.1f|r", equipped, maxLvl)
@@ -625,100 +1012,19 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
             ilvlLabel:SetFormattedText("|cFF00FF00%.1f|r", equipped)
         end
 
-        -- Engineering detection.
-        -- Own character: use the profession API directly — no scanning needed.
-        -- Inspected player: we can't call GetProfessions() on them, so we do a
-        -- lightweight scan of the 3 tinker slots only.  A tinker on any one of
-        -- them proves engineering.  The main loop below re-scans each slot
-        -- independently via ScanSlot, so this preliminary scan doesn't interfere.
-        local unitIsEngineer = (unit == "player") and IsEngineer()
-        if not unitIsEngineer then
-            for slot, patterns in pairs(ENG_TINKER_PATTERNS) do
-                local link = GetInventoryItemLink(unit, slot)
-                if link then
-                    for _, text in ipairs(GetInventoryTooltipLines(unit, slot)) do
-                        if text then
-                            local textLower = text:lower()
-                            for _, pat in ipairs(patterns) do
-                                if textLower:find(pat, 1, true) then
-                                    unitIsEngineer = true
-                                    break
-                                end
-                            end
-                        end
-                        if unitIsEngineer then break end
-                    end
-                end
-                if unitIsEngineer then break end
-            end
-        end
-
-        -- Hoist per-unit constants out of the slot loop
-        local unitIsPlayer  = (unit == "player")
-        -- Blacksmithing detection, same idea. The profession adds an extra socket to
-        -- wrists or hands, so more gems in the link than the item has base sockets
-        -- proves it. Link-based like the ring check below, but it can only see a
-        -- socket that has been filled: an empty blacksmith socket appears solely in
-        -- the tooltip. So a blacksmith who gemmed one of the two slots and left the
-        -- other bare is detected and warned about, while one who left both bare is
-        -- indistinguishable from a non-blacksmith and is not warned.
-        local unitIsBS = unitIsPlayer and IsBlacksmith()
-        if not unitIsBS then
-            for bsSlot in pairs(BS_SOCKET_SLOTS) do
-                local bsLink = GetInventoryItemLink(unit, bsSlot)
-                if bsLink and #GetFilledGemIDs(bsLink) > GetBaseSocketCount(bsLink) then
-                    unitIsBS = true
-                    break
-                end
-            end
-        end
-
-        -- Enchanting detection, same idea as engineering above. Ring enchants are
-        -- enchanter-only in MoP, so an enchant on either ring proves the profession
-        -- and means the other ring should carry one too. Unlike the tinker scan this
-        -- reads the item link, not the tooltip, so it cannot be fooled by an
-        -- incomplete read. If neither ring is enchanted nothing is inferred and no
-        -- warning is raised — an unenchanted pair is indistinguishable from a
-        -- non-enchanter.
-        local unitIsEnchant = unitIsPlayer and IsEnchanter()
-        if not unitIsEnchant then
-            for _, ringSlot in ipairs({ 11, 12 }) do
-                local ringLink = GetInventoryItemLink(unit, ringSlot)
-                if ringLink and GetEnchantFromLink(ringLink) ~= 0 then
-                    unitIsEnchant = true
-                    break
-                end
-            end
-        end
-        local _, unitClass  = UnitClass(unit)
-        local expectedArmor = unitClass and CLASS_ARMOR[unitClass]
-
-        -- Per-slot update (single pass — ScanSlot called once per slot here)
+        -- Per-slot update
         for _, info in ipairs(SLOT_BUTTONS) do
             local slot  = info.id
             local entry = slotLabels[slot]
             if entry then
-                local data = ScanSlot(unit, slot)
-                if data and data.incompleteRead then anyIncomplete = true end
-
-                -- A tooltip can be truncated rather than absent: after a cold client
-                -- start the item's own lines ("Уровень предмета") are present while the
-                -- tinker's "Использование:" line, which needs the enchant's spell data,
-                -- is not yet. That read looks complete but yields a false "no tinker"
-                -- warning. Treat an unseen tinker on an engineer's tinker slot as
-                -- incomplete too, so the bounded retry keeps looking instead of warning.
-                if data and unitIsEngineer and ENG_TINKER_PATTERNS[slot]
-                and not data.hasEngTinker then
-                    anyIncomplete = true
-                end
+                local slotEval = evalResult.slots[slot]
+                local data = slotEval and slotEval.data
 
                 -- Ilvl chip
                 if data and data.ilvl and data.ilvl > 0 then
                     local c = QUALITY_COLOR[data.quality] or QUALITY_COLOR[1]
                     entry.label:SetTextColor(c[1], c[2], c[3])
                     entry.label:SetText(data.ilvl)
-                    -- When the item is upgraded, show the base ilvl smaller to the
-                    -- right; otherwise just the single current number, centered.
                     if entry.sub and data.baseIlvl and data.baseIlvl > 0
                     and data.baseIlvl < data.ilvl then
                         entry.sub:SetText(data.baseIlvl)
@@ -738,134 +1044,15 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
                 end
 
                 -- Warning icon
-                if showIssues and entry.warn and data then
-                    -- In some clients GetInventoryItemLink(unit, 17) returns the 2H weapon
-                    -- link when no off-hand is equipped.  Skip all checks in that case.
-                    if slot == 17 and data.equipLoc == "INVTYPE_2HWEAPON" then
+                if showIssues and entry.warn then
+                    local issues = slotEval and slotEval.issues or {}
+                    if #issues > 0 then
+                        entry.warn._issues = issues
+                        entry.warn:Show()
+                    else
                         entry.warn._issues = {}
                         entry.warn:Hide()
-                    else
-                        local issues = {}
-
-                        if data.emptyGems > 0 then
-                            if data.emptyGems == 1 then
-                                table.insert(issues, "Пустое гнездо для самоцвета.")
-                            else
-                                table.insert(issues, "Пустых гнезд для самоцветов: " .. data.emptyGems .. ".")
-                            end
-                        end
-
-                        if data.outdatedGems > 0 then
-                            if data.outdatedGems == 1 then
-                                table.insert(issues, "Устаревший самоцвет.")
-                            else
-                                table.insert(issues, "Устаревших самоцветов: " .. data.outdatedGems .. ".")
-                            end
-                        end
-
-                        if data.lowQualityGems > 0 then
-                            if data.lowQualityGems == 1 then
-                                table.insert(issues, "Самоцвет низкого качества.")
-                            else
-                                table.insert(issues, "Самоцветов низкого качества: " .. data.lowQualityGems .. ".")
-                            end
-                        end
-
-                        if slot == 6 and data.totalSockets == 0 then
-                            table.insert(issues, "Нет пряжки для пояса.")
-                        end
-
-                        if BS_SOCKET_SLOTS[slot] and unitIsBS then
-                            local baseSockets = GetBaseSocketCount(data.link)
-                            if data.totalSockets <= baseSockets then
-                                table.insert(issues, "Нет дополнительного гнезда (кузнечное дело).")
-                            end
-                        end
-
-                        -- Enchanting: ring enchants (only enchanters can enchant rings)
-                        if (slot == 11 or slot == 12) and unitIsEnchant
-                        and not data.hasEnchant then
-                            table.insert(issues, "Отсутсвуют чары.")
-                        end
-
-                        -- Regular enchant check.
-                        -- Engineering tinkers and regular enchants are NOT mutually exclusive —
-                        -- both can be applied to gloves and cloaks simultaneously.
-                        if ENCHANT_SLOTS[slot] and not data.hasEnchant then
-                            local skip = slot == 17
-                                         and not (data.equipLoc and ENCHANTABLE_OH[data.equipLoc])
-                            if not skip then
-                                table.insert(issues, "Отсутсвуют чары.")
-                                -- If they have the tinker but skipped the enchant, educate them.
-                                if ENG_TINKER_PATTERNS[slot] and data.hasEngTinker then
-                                    table.insert(issues,
-                                        "На этот слот можно наложить и чары, и улучшение инженера.")
-                                end
-                            end
-                        end
-
-                        -- Engineering tinker checks.
-                        -- For own character, profession is checked directly.
-                        -- For inspected players, engineering is inferred from any observed tinker.
-                        if unitIsEngineer and ENG_TINKER_PATTERNS[slot] then
-                            if not data.hasEngTinker then
-                                table.insert(issues,
-                                    "Нет улучшения инженера: " .. ENG_TINKER_NAMES[slot] .. ".")
-                            end
-                        end
-
-                        -- Armor specialization: wrong armor type loses 5% primary stat bonus
-                        if ARMOR_SPEC_SLOTS[slot] and data.armorType then
-                            if expectedArmor and data.armorType ~= expectedArmor
-                            and data.armorType ~= "Miscellaneous" then
-                                table.insert(issues,
-                                    "Нарушен бонус специализации брони.")
-                            end
-                        end
-
-                        -- Item upgrades: flag items that have not been fully upgraded
-                        if data.upgradeLevel and data.maxUpgrade
-                        and data.upgradeLevel < data.maxUpgrade then
-                            table.insert(issues, string.format(
-                                "Предмет улучшен не полностью (%d/%d).",
-                                data.upgradeLevel, data.maxUpgrade))
-                        end
-
-                        -- Eye of the Black Prince: extra socket on Sha-Touched/ToT weapons (ilvl 522-541)
-                        if EYE_WEAPON_EQUIPLOC[data.equipLoc]
-                        and data.ilvl and data.ilvl >= EYE_MIN_ILVL and data.ilvl <= EYE_MAX_ILVL
-                        and not IsPvPItem(data.name) then
-                            local baseSockets = GetBaseSocketCount(data.link)
-                            if data.totalSockets <= baseSockets then
-                                table.insert(issues, "Нет гнезда от Ока Черного принца.")
-                            end
-                        end
-
-                        -- Legendary meta gem: Wrathion questline reward, relevant for ToT helms
-                        if slot == 1
-                        and data.ilvl and data.ilvl >= META_MIN_ILVL and data.ilvl <= META_MAX_ILVL
-                        and not IsPvPItem(data.name) then
-                            for _, gemID in ipairs(data.gemIDs) do
-                                local _, _, gemQuality, _, _, _, gemSubType = GetItemInfo(gemID)
-                                if gemSubType and gemSubType:find("Meta", 1, true) then
-                                    if (gemQuality or 0) < 5 then
-                                        table.insert(issues, "Нет легендарного особого самоцвета.")
-                                    end
-                                    break  -- only one meta socket possible
-                                end
-                            end
-                        end
-
-                        if #issues > 0 then
-                            entry.warn._issues = issues
-                            entry.warn:Show()
-                        else
-                            entry.warn._issues = {}
-                            entry.warn:Hide()
-                        end
                     end
-                elseif entry.warn then
-                    entry.warn:Hide()
                 end
             end
         end
@@ -875,12 +1062,10 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
             retryCount = 0
         else
             ilvlPanel:Show()
-            -- If any equipped slot returned an incomplete tooltip read, the async
-            -- data provider wasn't ready yet. Re-scan shortly (bounded) so the frame
-            -- self-heals to correct values without needing a /reload.
-            -- The budget covers a cold client start, where server item data can take
-            -- several seconds to arrive; 6 x 0.3s was too short and left the cold read
-            -- standing. GET_ITEM_INFO_RECEIVED catches anything slower than this.
+            -- If any equipped slot returned an incomplete tooltip read, the
+            -- async data provider wasn't ready yet. Re-scan shortly (bounded)
+            -- so the frame self-heals to correct values without needing a
+            -- /reload.
             if anyIncomplete and retryCount < RETRY_LIMIT then
                 retryCount = retryCount + 1
                 retryFrame = retryFrame or CreateFrame("Frame")
@@ -926,6 +1111,316 @@ local function SetupOverlay(parentFrame, slotPrefix, getUnit, showIssues, isActi
     return Refresh, HideAll, GetAllIssues
 end
 
+-- ── Party/raid roster window ─────────────────────────────────────────────────
+
+local ROSTER_ROW_HEIGHT = 22
+local ROSTER_MAX_ROWS   = 40  -- full raid
+
+local rosterFrame, rosterScrollChild, rosterRows
+
+-- NOTE ON CLOSURES: `row` below is the table this function returns, built as
+-- a local BEFORE any :SetScript wiring so every closure captures that same
+-- table (not the `frame` widget). GearLensRefreshRosterRows mutates row.unit on every
+-- refresh; Tasks 6/7/8 each add one more :SetScript call here, all placed
+-- right before `return row` so they close over the fully-built table and see
+-- row.unit updates made after the row was created.
+local function CreateRosterRow(parent, index)
+    local frame = CreateFrame("Frame", nil, parent)
+    frame:SetSize(340, ROSTER_ROW_HEIGHT)
+    frame:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -(index - 1) * ROSTER_ROW_HEIGHT)
+    frame:EnableMouse(true)
+
+    local name = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    name:SetPoint("LEFT", frame, "LEFT", 4, 0)
+    name:SetWidth(110)
+    name:SetJustifyH("LEFT")
+
+    local status = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    status:SetPoint("LEFT", name, "RIGHT", 4, 0)
+    status:SetWidth(110)
+    status:SetJustifyH("LEFT")
+
+    local recheckBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    recheckBtn:SetSize(96, 18)
+    recheckBtn:SetPoint("LEFT", status, "RIGHT", 4, 0)
+    recheckBtn:SetText("Перепроверить")
+    recheckBtn:Hide()
+
+    local whisperBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    whisperBtn:SetSize(24, 18)
+    whisperBtn:SetPoint("RIGHT", frame, "RIGHT", -28, 0)
+    whisperBtn:SetText("Ш")
+    whisperBtn:Hide()
+
+    local reportBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    reportBtn:SetSize(24, 18)
+    reportBtn:SetPoint("RIGHT", frame, "RIGHT", -2, 0)
+    reportBtn:SetText("О")
+    reportBtn:Hide()
+
+    frame:Hide()
+
+    local row = {
+        frame   = frame,
+        name    = name,
+        status  = status,
+        recheck = recheckBtn,
+        whisper = whisperBtn,
+        report  = reportBtn,
+        unit    = nil,
+    }
+
+    -- Tasks 6/7/8 insert more :SetScript calls here, above this line.
+
+    frame:SetScript("OnEnter", function(self)
+        local unit = row.unit
+        if not unit or rosterState[RosterKey(unit)] ~= "done" then return end
+        local eval = rosterEval[RosterKey(unit)]
+        if not eval then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(UnitName(unit) or unit)
+        local any = false
+        for _, info in ipairs(SLOT_BUTTONS) do
+            local slotEval = eval.slots[info.id]
+            if slotEval and #slotEval.issues > 0 then
+                any = true
+                for _, issue in ipairs(slotEval.issues) do
+                    GameTooltip:AddLine("[" .. slotEval.name .. "] " .. issue, 1, 0.5, 0, true)
+                end
+            end
+        end
+        if not any then
+            GameTooltip:AddLine("Проблем со снаряжением не найдено.", 0, 1, 0)
+        end
+        GameTooltip:Show()
+    end)
+    frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    recheckBtn:SetScript("OnClick", function()
+        if row.unit then GearLensRosterRecheckUnit(row.unit) end
+    end)
+
+    whisperBtn:SetScript("OnClick", function()
+        if row.unit then GearLensWhisperIssues(row.unit, GearLensBuildIssueList(rosterEval[RosterKey(row.unit)])) end
+    end)
+    reportBtn:SetScript("OnClick", function()
+        if row.unit then GearLensReportIssuesToChat(row.unit, GearLensBuildIssueList(rosterEval[RosterKey(row.unit)])) end
+    end)
+
+    return row
+end
+
+local function EnsureRosterFrame()
+    if rosterFrame then return end
+
+    rosterFrame = CreateFrame("Frame", "GearLensRosterFrame", UIParent, "BackdropTemplate")
+    rosterFrame:SetSize(380, 360)
+    rosterFrame:SetPoint("CENTER")
+    rosterFrame:SetFrameStrata("HIGH")
+    rosterFrame:SetMovable(true)
+    rosterFrame:EnableMouse(true)
+    rosterFrame:RegisterForDrag("LeftButton")
+    rosterFrame:SetScript("OnDragStart", rosterFrame.StartMoving)
+    rosterFrame:SetScript("OnDragStop", rosterFrame.StopMovingOrSizing)
+    rosterFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 32,
+        insets = { left = 11, right = 11, top = 11, bottom = 11 },
+    })
+    rosterFrame:Hide()
+    rosterFrame:SetScript("OnHide", GearLensRosterStopScan)
+
+    local title = rosterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", rosterFrame, "TOP", 0, -16)
+    title:SetText("GearLens: Проверка группы")
+
+    local closeBtn = CreateFrame("Button", nil, rosterFrame, "UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT", rosterFrame, "TOPRIGHT", -4, -4)
+    closeBtn:SetScript("OnClick", function() rosterFrame:Hide() end)
+
+    local scroll = CreateFrame("ScrollFrame", "GearLensRosterScrollFrame", rosterFrame,
+        "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", rosterFrame, "TOPLEFT", 12, -40)
+    scroll:SetPoint("BOTTOMRIGHT", rosterFrame, "BOTTOMRIGHT", -30, 16)
+
+    rosterScrollChild = CreateFrame("Frame", nil, scroll)
+    rosterScrollChild:SetSize(340, ROSTER_ROW_HEIGHT * ROSTER_MAX_ROWS)
+    scroll:SetScrollChild(rosterScrollChild)
+
+    rosterRows = {}
+    for i = 1, ROSTER_MAX_ROWS do
+        rosterRows[i] = CreateRosterRow(rosterScrollChild, i)
+    end
+end
+
+local rosterUnitRow = {}  -- unit token -> row index, rebuilt each GearLensRefreshRosterRows call
+
+local function DescribeRosterRow(row, unit)
+    row.recheck:Hide()
+    row.whisper:Hide()
+    row.report:Hide()
+
+    if not unit then
+        row.status:SetText("")
+        return
+    end
+
+    local state = rosterState[RosterKey(unit)]
+    if state == "pending" then
+        row.status:SetTextColor(0.7, 0.7, 0.7)
+        row.status:SetText("В очереди...")
+    elseif state == "scanning" then
+        row.status:SetTextColor(0.7, 0.7, 0.7)
+        row.status:SetText("Проверка...")
+    elseif state == "far" then
+        row.status:SetTextColor(1, 0.3, 0.3)
+        row.status:SetText("Далеко")
+        row.recheck:Show()
+    elseif state == "done" then
+        local eval = rosterEval[RosterKey(unit)]
+        if not eval then
+            row.status:SetText("")
+            return
+        end
+        local issueCount = 0
+        for _, slotEval in pairs(eval.slots) do
+            issueCount = issueCount + #slotEval.issues
+        end
+        if issueCount > 0 then
+            row.status:SetTextColor(1, 0.5, 0)
+            row.status:SetFormattedText("%.0f — проблем: %d", eval.avgIlvl, issueCount)
+            if not UnitIsUnit(unit, "player") then
+                row.whisper:Show()
+                row.report:Show()
+            end
+        else
+            row.status:SetTextColor(0.12, 1, 0)
+            row.status:SetFormattedText("%.0f — ОК", eval.avgIlvl)
+        end
+    else
+        row.status:SetText("")
+    end
+end
+
+function GearLensRefreshRosterRows()
+    local units = GetGroupUnits()
+    wipe(rosterUnitRow)
+    for i, row in ipairs(rosterRows) do
+        local unit = units[i]
+        row.unit = unit
+        if unit then
+            rosterUnitRow[unit] = i
+            local _, class = UnitClass(unit)
+            local color = class and RAID_CLASS_COLORS[class]
+            if color then
+                row.name:SetTextColor(color.r, color.g, color.b)
+            else
+                row.name:SetTextColor(1, 1, 1)
+            end
+            row.name:SetText(UnitName(unit) or unit)
+            DescribeRosterRow(row, unit)
+            row.frame:Show()
+        else
+            row.frame:Hide()
+        end
+    end
+end
+
+local function OnRosterUnitUpdate(unit)
+    local idx = rosterUnitRow[unit]
+    local row = idx and rosterRows[idx]
+    if row then DescribeRosterRow(row, unit) end
+end
+
+function GearLensToggleRosterWindow()
+    EnsureRosterFrame()
+    if rosterFrame:IsShown() then
+        rosterFrame:Hide()
+        return
+    end
+    GearLensRefreshRosterRows()
+    GearLensRosterStartScan(GetGroupUnits(), OnRosterUnitUpdate)
+    rosterFrame:Show()
+end
+
+-- If the group's composition changes while the roster window is open,
+-- rebuild the row list but leave already-"done" members alone — only newly
+-- present members (not yet marked "done"/"pending"/"scanning" for their
+-- GUID) get queued via GearLensRosterRecheckUnit, which reuses the same
+-- queue-or-run-now logic the per-row Recheck button uses. This does NOT
+-- reset state on every roster event, so a member who finished scanning a
+-- moment ago isn't redundantly re-inspected because someone else joined or
+-- left.
+--
+-- GUIDs that drop out of the group entirely (member left) are also purged from
+-- rosterState/rosterEval here. Without this, a member who leaves and rejoins
+-- later in the same window-open session would keep showing their stale
+-- pre-leave "done" snapshot with no indication it's stale, since a rejoined
+-- member's GUID is identical to before and the state-based re-queue check
+-- above would see "done" and skip it.
+local rosterUpdateFrame = CreateFrame("Frame")
+rosterUpdateFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+rosterUpdateFrame:SetScript("OnEvent", function()
+    if not (rosterFrame and rosterFrame:IsShown()) then return end
+
+    GearLensRefreshRosterRows()
+
+    local currentUnits = GetGroupUnits()
+    local currentGUIDs = {}
+    for _, unit in ipairs(currentUnits) do
+        currentGUIDs[RosterKey(unit)] = true
+    end
+    for key in pairs(rosterState) do
+        if not currentGUIDs[key] then
+            rosterState[key] = nil
+            rosterEval[key] = nil
+            rosterRetryCount[key] = nil
+        end
+    end
+
+    for _, unit in ipairs(currentUnits) do
+        local state = rosterState[RosterKey(unit)]
+        if state ~= "done" and state ~= "pending" and state ~= "scanning" then
+            GearLensRosterRecheckUnit(unit)
+        end
+    end
+end)
+
+-- ── Minimap button ────────────────────────────────────────────────────────────
+-- Fixed position (no dragging, no SavedVariables) — simplest option that
+-- still gives one-click access to the roster window.
+
+local function CreateMinimapButton()
+    local btn = CreateFrame("Button", "GearLensMinimapButton", Minimap)
+    btn:SetSize(31, 31)
+    btn:SetFrameStrata("MEDIUM")
+    btn:SetFrameLevel(8)
+
+    local angle = math.rad(220)
+    btn:SetPoint("CENTER", Minimap, "CENTER",
+        -80 * math.cos(angle), 80 * math.sin(angle))
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(20, 20)
+    icon:SetPoint("CENTER", btn, "CENTER", 0, 1)
+    icon:SetTexture("Interface\\AddOns\\GearLensRu\\GearLens_Icon")
+
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetSize(54, 54)
+    border:SetPoint("TOPLEFT", btn, "TOPLEFT")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+
+    btn:SetScript("OnClick", GearLensToggleRosterWindow)
+    btn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:SetText("GearLens")
+        GameTooltip:AddLine("Проверка снаряжения группы", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
 -- ── Addon init ────────────────────────────────────────────────────────────────
 
 local inspectUnit    = "target"
@@ -941,6 +1436,55 @@ local function GetChatChannel()
         return IsInGroup(instCat) and "INSTANCE_CHAT" or "PARTY"
     end
     return "SAY"
+end
+
+-- Sends each flagged slot's issues as a whisper to `unit`. Shared by the
+-- Inspect frame's Whisper button and the roster window's per-row button.
+function GearLensWhisperIssues(unit, allIssues)
+    if #allIssues == 0 then
+        print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
+        return
+    end
+    local name, realm = UnitName(unit)
+    if not name then return end
+    local target = (realm and realm ~= "") and (name .. "-" .. realm) or name
+    SendChatMessage("GearLens: отчет по снаряжению", "WHISPER", nil, target)
+    for _, entry in ipairs(allIssues) do
+        for _, issue in ipairs(entry.issues) do
+            SendChatMessage("[" .. entry.name .. "] " .. issue, "WHISPER", nil, target)
+        end
+    end
+end
+
+-- Sends each flagged slot's issues to the current chat channel, prefixed
+-- with the target's name. Shared the same way as GearLensWhisperIssues above.
+function GearLensReportIssuesToChat(unit, allIssues)
+    if #allIssues == 0 then
+        print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
+        return
+    end
+    local name    = UnitName(unit) or "Неизвестно"
+    local channel = GetChatChannel()
+    SendChatMessage("GearLens: проблемы со снаряжением у " .. name .. ":", channel)
+    for _, entry in ipairs(allIssues) do
+        for _, issue in ipairs(entry.issues) do
+            SendChatMessage("[" .. entry.name .. "] " .. issue, channel)
+        end
+    end
+end
+
+-- Converts an EvaluateUnit() result into the { name, issues } array shape
+-- GearLensWhisperIssues/GearLensReportIssuesToChat expect (same shape GetAllIssues() returns).
+function GearLensBuildIssueList(eval)
+    local result = {}
+    if not eval then return result end
+    for _, info in ipairs(SLOT_BUTTONS) do
+        local slotEval = eval.slots[info.id]
+        if slotEval and #slotEval.issues > 0 then
+            table.insert(result, { name = slotEval.name, issues = slotEval.issues })
+        end
+    end
+    return result
 end
 
 local function SetupInspectOverlay()
@@ -963,21 +1507,8 @@ local function SetupInspectOverlay()
     whisperBtn:SetText("Шепнуть игроку")
     whisperBtn:Hide()
     whisperBtn:SetScript("OnClick", function()
-        local allIssues = inspectGetIssues()
-        if #allIssues == 0 then
-            print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
-            return
-        end
         local unit = (InspectFrame and InspectFrame.unit) or inspectUnit
-        local name, realm = UnitName(unit)
-        if not name then return end
-        local target = (realm and realm ~= "") and (name .. "-" .. realm) or name
-        SendChatMessage("GearLens: отчет по снаряжению", "WHISPER", nil, target)
-        for _, entry in ipairs(allIssues) do
-            for _, issue in ipairs(entry.issues) do
-                SendChatMessage("[" .. entry.name .. "] " .. issue, "WHISPER", nil, target)
-            end
-        end
+        GearLensWhisperIssues(unit, inspectGetIssues())
     end)
 
     -- ── Report to Chat button ─────────────────────────────────────────────────
@@ -988,20 +1519,8 @@ local function SetupInspectOverlay()
     reportBtn:SetText("Отправить в чат")
     reportBtn:Hide()
     reportBtn:SetScript("OnClick", function()
-        local allIssues = inspectGetIssues()
-        if #allIssues == 0 then
-            print("|cFF00FF00GearLens:|r Проблем со снаряжением не найдено.")
-            return
-        end
-        local unit    = (InspectFrame and InspectFrame.unit) or inspectUnit
-        local name    = UnitName(unit) or "Неизвестно"
-        local channel = GetChatChannel()
-        SendChatMessage("GearLens: проблемы со снаряжением у " .. name .. ":", channel)
-        for _, entry in ipairs(allIssues) do
-            for _, issue in ipairs(entry.issues) do
-                SendChatMessage("[" .. entry.name .. "] " .. issue, channel)
-            end
-        end
+        local unit = (InspectFrame and InspectFrame.unit) or inspectUnit
+        GearLensReportIssuesToChat(unit, inspectGetIssues())
     end)
 
     -- Wrap the raw refresh so both buttons are shown/hidden based on issue state
@@ -1128,6 +1647,7 @@ loader:SetScript("OnEvent", function(_, event, arg1)
 
             -- LoadAddOn("Blizzard_InspectUI") -- TODO: LoadAddon is not working
             SetupInspectOverlay()
+            CreateMinimapButton()
 
         elseif arg1 == "Blizzard_InspectUI" then
             SetupInspectOverlay()
@@ -1162,6 +1682,7 @@ loader:SetScript("OnEvent", function(_, event, arg1)
 
     elseif event == "INSPECT_READY" then
         SetupInspectOverlay()
+        GearLensRosterOnInspectReady()
 
         if InspectFrame and InspectFrame:IsShown() and inspectRefresh then
             -- Normal manual inspect: immediate pass for ilvl numbers, then a
@@ -1195,6 +1716,26 @@ SLASH_GEARLENSRU1 = "/glr"
 SlashCmdList["GEARLENSRU"] = function(msg)
     local usingCTI = (C_TooltipInfo and C_TooltipInfo.GetInventoryItem) and true or false
     local cmd, arg = (msg or ""):lower():match("^%s*(%a*)%s*(%d*)")
+
+    if cmd == "group" then
+        GearLensToggleRosterWindow()
+        return
+    end
+
+    if cmd == "roster" then
+        local units = GetGroupUnits()
+        print(("|cFF00FF00GearLens:|r Проверка группы: %d участников"):format(#units))
+        for _, unit in ipairs(units) do
+            local key   = RosterKey(unit)
+            local state = rosterState[key] or "(нет данных)"
+            local eval  = rosterEval[key]
+            local inRange = IsUnitInspectable(unit)
+            local ilvlText = eval and string.format("%.0f", eval.avgIlvl) or "—"
+            print(("  %s (%s): состояние=%s  в радиусе=%s  ilvl=%s"):format(
+                UnitName(unit) or unit, unit, state, tostring(inRange), ilvlText))
+        end
+        return
+    end
 
     -- "/glr diag": the decisive evidence in one paste. For each tinker slot it shows
     -- how many lines the scan returned, every "Использование:" line found, and the

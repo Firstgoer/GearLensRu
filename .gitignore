@@ -7,3 +7,4 @@ dist/
 # IDE / tooling
 .idea/
 .claude/
+.superpowers/
