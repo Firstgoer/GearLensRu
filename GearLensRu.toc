@@ -1,8 +1,8 @@
 ## Interface: 50504
 ## Title: GearLensRu
-## Notes: Displays per-slot item levels and average ilvl on the Character and Inspect frames. Flags missing enchants, gems, belt buckles, profession sockets, tinkers, armor specialization violations, and incomplete upgrades. Russian (ruRU) client only.
-## Notes-ruRU: Показывает уровень предметов по слотам и средний ilvl в окне персонажа и осмотра. Отмечает отсутствие чар, самоцветов, пряжки для пояса, гнезд от профессий, улучшений инженера, нарушения специализации брони и неполные улучшения предметов.
-## Version: 1.7
+## Notes: Displays per-slot item levels and average ilvl on the Character and Inspect frames. Flags missing enchants, gems, belt buckles, profession sockets, tinkers, armor specialization violations, and incomplete upgrades. A minimap button opens a party/raid gear check window with per-member ilvl, issue flags, and range-aware rechecking. Russian (ruRU) client only.
+## Notes-ruRU: Показывает уровень предметов по слотам и средний ilvl в окне персонажа и осмотра. Отмечает отсутствие чар, самоцветов, пряжки для пояса, гнезд от профессий, улучшений инженера, нарушения специализации брони и неполные улучшения предметов. Кнопка на миникарте открывает окно проверки снаряжения группы или рейда: средний ilvl и проблемы по каждому участнику, с повторной проверкой для тех, кто далеко.
+## Version: 1.8
 ## IconTexture: Interface\AddOns\GearLensRu\GearLens_Icon
 ## Category: Character
 ## Category-ruRU: Персонаж
